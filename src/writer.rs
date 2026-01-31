@@ -1,21 +1,24 @@
-use std::io::{self, Seek, Write};
-
-use crate::{error::TitaniumError, log_entry::LogEntry};
-
-pub struct Writer<W: Write + Seek> {
+use crate::error::TitaniumError;
+use crate::log_entry::LogEntry;
+use crate::storage::Storage;
+use std::io;
+use std::io::Write;
+// 修改泛型约束，使用我们新的 Storage trait
+pub struct Writer<W: Storage> {
     writer: io::BufWriter<W>,
-    current_offset: u64, // tracks the current write offset
+    current_offset: u64,
 }
 
-impl<W: Write + Seek> Writer<W> {
+impl<W: Storage> Writer<W> {
     pub fn new(inner: W) -> Self {
-        Writer {
+        Self {
             writer: io::BufWriter::new(inner),
             current_offset: 0,
+            // 💡 思考：如果是追加模式，这里应该 seek 到文件末尾获取初始 offset
+            // 但目前 Day 2 假设新文件，0 是可以的。
         }
     }
 
-    // Write a log entry, returning the offset at which it was written
     pub fn write_entry(&mut self, entry: &LogEntry) -> Result<u64, TitaniumError> {
         let offset = self.current_offset;
         let bytes_written = LogEntry::encode_to(&entry.key, &entry.value, &mut self.writer)?;
@@ -23,9 +26,19 @@ impl<W: Write + Seek> Writer<W> {
         Ok(offset)
     }
 
-    // Flush the buffer to ensure all data is written to the underlying storage
+    // 普通的 flush，仅推送到系统缓存 (快，不安全)
     pub fn flush(&mut self) -> Result<(), TitaniumError> {
         self.writer.flush()?;
+        Ok(())
+    }
+
+    // ⚡️ 真正的落盘 (慢，安全)
+    // 通常仅在事务提交或关键数据写入时调用
+    pub fn sync(&mut self) -> Result<(), TitaniumError> {
+        // 1. 先把 BufWriter 的数据推给内核
+        self.writer.flush()?;
+        // 2. 再命令内核推给磁盘
+        self.writer.get_mut().sync()?;
         Ok(())
     }
 }

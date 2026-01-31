@@ -1,11 +1,14 @@
 mod error;
 mod log_entry;
+mod storage;
 mod writer;
-
 use std::fs::File;
+use std::io::{Seek, SeekFrom};
 
 use crate::error::TitaniumError;
+use crate::log_entry::{Decoder, LogEntry};
 use crate::writer::Writer;
+
 fn main() -> Result<(), TitaniumError> {
     let file = File::options()
         .create(true)
@@ -18,13 +21,30 @@ fn main() -> Result<(), TitaniumError> {
     for i in 0..10 {
         let key = format!("key{}", i);
         let value = vec![i as u8; 10];
-        let entry = log_entry::LogEntry {
-            key: key,
-            value: value, // value is a vector of ten bytes, each set to i
+        let entry = LogEntry {
+            key,
+            value, // value is a vector of ten bytes, each set to i
         };
         let offset = writer.write_entry(&entry)?;
         writer.flush()?;
         println!("Wrote entry at offset {}", offset);
     }
+
+    // --- 验证读取 ---
+    println!("\nReading back entries...");
+    let mut reader_file = File::options().read(true).open("output.log")?;
+    reader_file.seek(SeekFrom::Start(0))?; // 回到文件开头
+    let mut decoder = Decoder::new();
+
+    for i in 0..10 {
+        let entry = decoder.decode_from(&mut reader_file)?;
+        println!(
+            "Read entry: key={}, value_len={}",
+            entry.key,
+            entry.value.len()
+        );
+        assert_eq!(entry.key, format!("key{}", i));
+    }
+
     Ok(())
 }
