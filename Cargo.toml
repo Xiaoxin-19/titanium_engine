@@ -1,0 +1,11 @@
+[package]
+name = "titanium_engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+byteorder = "1.5" # 用于跨平台字节序一致性
+crc32fast = "1.4"
+libc = "0.2.180"
+thiserror = "2.0.18"
