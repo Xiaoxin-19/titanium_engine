@@ -1,1 +1,14 @@
 /target
+*.log
+
+# Performance profiling
+perf.data
+perf.data.old
+
+# OS files
+.DS_Store
+
+# Editor config
+.idea/
+.vscode/
+*.swp
