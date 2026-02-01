@@ -7,11 +7,35 @@ use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-struct KVStore {
+/// 一个辅助结构体，用于将 read_at 适配为 Read trait
+/// 这样 Decoder 就可以在不改变文件游标的情况下读取数据
+pub struct FileAtReader<'a> {
+    file: &'a File,
+    offset: u64,
+}
+
+impl<'a> Read for FileAtReader<'a> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        #[cfg(unix)]
+        let n = {
+            use std::os::unix::fs::FileExt;
+            self.file.read_at(buf, self.offset)?
+        };
+        #[cfg(windows)]
+        let n = {
+            use std::os::windows::fs::FileExt;
+            self.file.seek_read(buf, self.offset)?
+        };
+
+        self.offset += n as u64;
+        Ok(n)
+    }
+}
+
+pub struct KVStore {
     map: HashMap<String, LogIndex>,
     writer: Writer<std::fs::File>,
     file_list: Vec<std::fs::File>,
-    decoder: Decoder,
 }
 
 // 常量字符串必须是 &str 类型
@@ -29,12 +53,11 @@ impl KVStore {
         let active_path = format!("{}/{}", data_path, ACTIVE_FILE);
         // 默认 active.bs 为写入文件， 为写入文件创建读写文件描述符
         let active_file = fs::File::options()
-            .append(true)
+            .append(true) // TODO: use pre allocation to avoid metadata frequency update
             .write(true)
             .read(true)
             .create(true)
             .open(active_path)?;
-
         // 其他静态 bs 文件格式为： 0001.bs 0002.bs， 为其他静态文件创建只读文件描述
         let mut readers = Vec::new();
         let mut paths: Vec<_> = fs::read_dir(&data_path)?
@@ -46,7 +69,10 @@ impl KVStore {
                     && path.file_name().map_or(false, |name| name != ACTIVE_FILE)
             })
             .collect();
-
+        // 首先加入 active.bs 文件句柄
+        readers.push(active_file);
+        // 生成writer使用的文件句柄
+        let reader_active_file = readers[0].try_clone()?;
         // 按文件名排序，确保按顺序加载 (例如 0001.bs, 0002.bs)
         paths.sort();
         for path in paths {
@@ -55,14 +81,13 @@ impl KVStore {
 
         // 先克隆一份文件句柄给 Writer，保留原句柄给 file_list
         // 注意：这里需要 clone 文件句柄，因为 writer 会拿走一个，file_list 也要存一个
-        let writer = Writer::new(active_file.try_clone()?);
-        readers.push(active_file);
+        let file_len = reader_active_file.metadata()?.len();
+        let writer = Writer::new(reader_active_file, file_len);
 
         Ok(KVStore {
             map: HashMap::new(),
             writer,
             file_list: readers,
-            decoder: Decoder::new(),
         })
     }
 
@@ -70,6 +95,7 @@ impl KVStore {
         // 1. write to log file
         let entry = LogEntry { key, value };
         let offset = self.writer.write_entry(&entry)?;
+        // TODO : use config to decide when to sync, now always sync after write
         self.writer.sync()?;
         // 2. update hashmap
         self.map.insert(
@@ -79,38 +105,50 @@ impl KVStore {
         Ok(())
     }
 
-    pub fn get(&mut self, key: String) -> Result<Option<LogEntry>, TitaniumError> {
+    pub fn get(&self, key: String) -> Result<Option<LogEntry>, TitaniumError> {
         let log_index = match self.map.get(&key) {
             Some(index) => index,
             None => return Ok(None),
         };
+        let file = &self.file_list[log_index.file_id as usize];
+        // 使用 FileAtReader 替代 seek，实现无锁并发读取
+        let mut reader = FileAtReader {
+            file,
+            offset: log_index.offset,
+        };
 
-        let mut file = &self.file_list[log_index.file_id as usize];
-        file.seek(SeekFrom::Start(log_index.offset))?;
-
-        let entry = self.decoder.decode_from(&mut file)?;
+        // 使用局部的 decoder，避免借用 self.decoder 需要的可变引用
+        let mut decoder = Decoder::new();
+        let entry = decoder.decode_from(&mut reader)?;
         Ok(Some(entry))
     }
 
     /// 流式读取接口：返回 (Value长度, Reader)
     /// 调用者可以使用 reader 按需读取 Value，避免大 Value 占用过多内存
-    pub fn get_reader(
-        &mut self,
+    pub fn get_reader<'a>(
+        &'a self,
         key: &str,
-    ) -> Result<Option<(u64, std::io::Take<&File>)>, TitaniumError> {
+    ) -> Result<Option<(u64, std::io::Take<FileAtReader<'a>>)>, TitaniumError> {
         let log_index = match self.map.get(key) {
             Some(index) => index,
             None => return Ok(None),
         };
 
-        let mut file = &self.file_list[log_index.file_id as usize];
-        file.seek(SeekFrom::Start(log_index.offset))?;
+        let file = &self.file_list[log_index.file_id as usize];
+
+        // 使用 FileAtReader 替代 seek，实现无锁并发读取
+        let mut reader = FileAtReader {
+            file,
+            offset: log_index.offset,
+        };
 
         // 1. 读取头部和 Key
-        let (v_len, _key_in_file) = self.decoder.decode_header_and_key(&mut file)?;
+        let mut decoder = Decoder::new();
+        // TODO: use mmap to avoid big value OOM
+        let (v_len, _crc, _key_in_file) = decoder.decode_header_and_key(&mut reader)?;
 
         // 2. 返回限制长度的 Reader，直接指向 Value 数据
-        Ok(Some((v_len as u64, file.take(v_len as u64))))
+        Ok(Some((v_len as u64, reader.take(v_len as u64))))
     }
 }
 

@@ -3,6 +3,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{self, Read, Write};
 
 // log entry
+#[derive(Debug, Clone, PartialEq)]
 pub struct LogEntry {
     pub key: String,
     pub value: Vec<u8>,
@@ -112,8 +113,11 @@ impl Decoder {
 
     /// 仅解码头部和 Key，返回 (Value长度, Key)，并将 Reader 指针停留在 Value 的起始位置。
     /// 用于流式读取 Value。
-    pub fn decode_header_and_key<R: Read>(&mut self, reader: &mut R) -> Result<(u32, String), TitaniumError> {
-        let _crc = reader.read_u32::<LittleEndian>()?;
+    pub fn decode_header_and_key<R: Read>(
+        &mut self,
+        reader: &mut R,
+    ) -> Result<(u32, u32, String), TitaniumError> {
+        let crc = reader.read_u32::<LittleEndian>()?;
         let k_len = decode_varint(reader)?;
         let v_len = decode_varint(reader)?;
 
@@ -131,7 +135,7 @@ impl Decoder {
         let key = String::from_utf8(self.key_buf.clone())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Key is not valid UTF-8"))?;
 
-        Ok((v_len, key))
+        Ok((v_len, crc, key))
     }
 }
 
@@ -145,7 +149,7 @@ impl Decoder {
 /// Second byte:    0000 0010 (0x02) -> remaining bits
 /// Result:         0xAC02
 /// ```
-fn encode_varint(mut n: u32, buf: &mut [u8]) -> usize {
+pub fn encode_varint(mut n: u32, buf: &mut [u8]) -> usize {
     let mut counter = 0;
     loop {
         let mut b = (n & 0x7F) as u8;
@@ -191,5 +195,94 @@ fn decode_varint<R: Read>(reader: &mut R) -> Result<u32, TitaniumError> {
             return Ok(result);
         }
         shift += 7;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn test_varint() {
+        let mut buf = [0u8; 5];
+
+        // Test small number
+        let n = encode_varint(50, &mut buf);
+        assert_eq!(n, 1);
+        assert_eq!(buf[0], 50);
+        let mut cursor = Cursor::new(&buf[..n]);
+        assert_eq!(decode_varint(&mut cursor).unwrap(), 50);
+
+        // Test number > 127 (300 = 0x12C)
+        // Binary: 0000 0001 0010 1100
+        // 7 bits groups: 0000010 (2) | 0101100 (44)
+        // Encoded: [44 | 0x80, 2] = [0xAC, 0x02]
+        let n = encode_varint(300, &mut buf);
+        assert_eq!(n, 2);
+        assert_eq!(buf[0], 0xAC);
+        assert_eq!(buf[1], 0x02);
+        let mut cursor = Cursor::new(&buf[..n]);
+        assert_eq!(decode_varint(&mut cursor).unwrap(), 300);
+    }
+
+    #[test]
+    fn test_log_entry_encode_decode() {
+        let key = "test_key";
+        let value = b"test_value";
+        let mut buf = Vec::new();
+
+        // Encode
+        let written = LogEntry::encode_to(key, value, &mut buf).unwrap();
+        assert!(written > 0);
+
+        // Decode
+        let mut cursor = Cursor::new(buf);
+        let mut decoder = Decoder::new();
+        let entry = decoder.decode_from(&mut cursor).unwrap();
+
+        assert_eq!(entry.key, key);
+        assert_eq!(entry.value, value);
+    }
+
+    #[test]
+    fn test_crc_mismatch() {
+        let key = "key";
+        let value = b"val";
+        let mut buf = Vec::new();
+        LogEntry::encode_to(key, value, &mut buf).unwrap();
+
+        // Corrupt the data (flip bits in the last byte of value)
+        let len = buf.len();
+        buf[len - 1] ^= 0xFF;
+
+        let mut cursor = Cursor::new(buf);
+        let mut decoder = Decoder::new();
+        let err = decoder.decode_from(&mut cursor).unwrap_err();
+
+        match err {
+            TitaniumError::CrcMismatch { .. } => (),
+            _ => panic!("Expected CrcMismatch error, got {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_decode_header_and_key() {
+        let key = "long_key";
+        let value = vec![1u8; 100];
+        let mut buf = Vec::new();
+        LogEntry::encode_to(key, &value, &mut buf).unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        let mut decoder = Decoder::new();
+        let (v_len, _crc, decoded_key) = decoder.decode_header_and_key(&mut cursor).unwrap();
+
+        assert_eq!(decoded_key, key);
+        assert_eq!(v_len, 100);
+
+        // Verify cursor position (should be at the start of value)
+        let mut remaining = Vec::new();
+        cursor.read_to_end(&mut remaining).unwrap();
+        assert_eq!(remaining, value);
     }
 }

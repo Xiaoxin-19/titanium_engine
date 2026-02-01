@@ -10,10 +10,10 @@ pub struct Writer<W: Storage> {
 }
 
 impl<W: Storage> Writer<W> {
-    pub fn new(inner: W) -> Self {
+    pub fn new(inner: W, offset: u64) -> Self {
         Self {
             writer: io::BufWriter::new(inner),
-            current_offset: 0,
+            current_offset: offset,
             // 💡 思考：如果是追加模式，这里应该 seek 到文件末尾获取初始 offset
             // 但目前 Day 2 假设新文件，0 是可以的。
         }

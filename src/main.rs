@@ -19,7 +19,7 @@ fn main() -> Result<(), TitaniumError> {
         .open("output.log")?;
 
     // use the Writer to write log entries to the file
-    let mut writer = Writer::new(file);
+    let mut writer = Writer::new(file, 0);
 
     for i in 0..1000 {
         let key = format!("key{}", i);
