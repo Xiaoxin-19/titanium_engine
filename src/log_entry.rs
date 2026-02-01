@@ -109,6 +109,30 @@ impl Decoder {
             value: self.value_buf.clone(), // must clone to return owned data
         })
     }
+
+    /// 仅解码头部和 Key，返回 (Value长度, Key)，并将 Reader 指针停留在 Value 的起始位置。
+    /// 用于流式读取 Value。
+    pub fn decode_header_and_key<R: Read>(&mut self, reader: &mut R) -> Result<(u32, String), TitaniumError> {
+        let _crc = reader.read_u32::<LittleEndian>()?;
+        let k_len = decode_varint(reader)?;
+        let v_len = decode_varint(reader)?;
+
+        // 同样进行大小检查
+        if k_len > 10 * 1024 * 1024 || v_len > 10 * 1024 * 1024 {
+            return Err(TitaniumError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Entry too large",
+            )));
+        }
+
+        self.key_buf.resize(k_len as usize, 0);
+        reader.read_exact(&mut self.key_buf)?;
+
+        let key = String::from_utf8(self.key_buf.clone())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Key is not valid UTF-8"))?;
+
+        Ok((v_len, key))
+    }
 }
 
 /// Encodes a u32 integer into a variable-length format (Varint). returns the number of bytes written.

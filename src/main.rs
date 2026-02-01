@@ -1,4 +1,6 @@
 mod error;
+mod index;
+mod kv;
 mod log_entry;
 mod storage;
 mod writer;
