@@ -26,12 +26,6 @@ impl<W: Storage> Writer<W> {
         Ok(offset)
     }
 
-    // 普通的 flush，仅推送到系统缓存 (快，不安全)
-    pub fn flush(&mut self) -> Result<(), TitaniumError> {
-        self.writer.flush()?;
-        Ok(())
-    }
-
     // ⚡️ 真正的落盘 (慢，安全)
     // 通常仅在事务提交或关键数据写入时调用
     pub fn sync(&mut self) -> Result<(), TitaniumError> {

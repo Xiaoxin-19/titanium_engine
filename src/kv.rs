@@ -1,10 +1,10 @@
 use crate::error::TitaniumError;
 use crate::index::LogIndex;
-use crate::log_entry::{Decoder, LogEntry};
+use crate::log_entry::{self, Decoder, LogEntry};
 use crate::writer::Writer;
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 /// 一个辅助结构体，用于将 read_at 适配为 Read trait
@@ -32,6 +32,43 @@ impl<'a> Read for FileAtReader<'a> {
     }
 }
 
+impl<'a> Seek for FileAtReader<'a> {
+    fn rewind(&mut self) -> io::Result<()> {
+        self.offset = 0;
+        Ok(())
+    }
+
+    fn stream_position(&mut self) -> io::Result<u64> {
+        Ok(self.offset)
+    }
+
+    fn seek_relative(&mut self, offset: i64) -> io::Result<()> {
+        self.seek(SeekFrom::Current(offset))?;
+        Ok(())
+    }
+
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let new_offset = match pos {
+            SeekFrom::Start(offset) => Some(offset),
+            SeekFrom::Current(offset) => self.offset.checked_add_signed(offset),
+            SeekFrom::End(offset) => {
+                let len = self.file.metadata()?.len();
+                len.checked_add_signed(offset)
+            }
+        };
+
+        if let Some(n) = new_offset {
+            self.offset = n;
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid seek to a negative or overflowing position",
+            ));
+        }
+        Ok(self.offset)
+    }
+}
+
 pub struct KVStore {
     map: HashMap<String, LogIndex>,
     writer: Writer<std::fs::File>,
@@ -42,7 +79,7 @@ pub struct KVStore {
 const ACTIVE_FILE: &str = "active.bs";
 
 impl KVStore {
-    pub fn new(data_path: String) -> Result<Self, TitaniumError> {
+    pub fn new(data_path: &str) -> Result<Self, TitaniumError> {
         // 扫描目录，查找数据文件，如果没有目录，则创建对应目录，并初始化bs文件
         // 使用 Path::new 检查是否存在，避免所有权被转移
         if !Path::new(&data_path).exists() {
@@ -123,32 +160,55 @@ impl KVStore {
         Ok(Some(entry))
     }
 
-    /// 流式读取接口：返回 (Value长度, Reader)
-    /// 调用者可以使用 reader 按需读取 Value，避免大 Value 占用过多内存
-    pub fn get_reader<'a>(
-        &'a self,
-        key: &str,
-    ) -> Result<Option<(u64, std::io::Take<FileAtReader<'a>>)>, TitaniumError> {
-        let log_index = match self.map.get(key) {
-            Some(index) => index,
-            None => return Ok(None),
-        };
-
-        let file = &self.file_list[log_index.file_id as usize];
-
-        // 使用 FileAtReader 替代 seek，实现无锁并发读取
-        let mut reader = FileAtReader {
-            file,
-            offset: log_index.offset,
-        };
-
-        // 1. 读取头部和 Key
+    // 程序重启后，恢复 KVStore 状态
+    pub fn restore(&mut self) -> Result<(), TitaniumError> {
         let mut decoder = Decoder::new();
-        // TODO: use mmap to avoid big value OOM
-        let (v_len, _crc, _key_in_file) = decoder.decode_header_and_key(&mut reader)?;
-
-        // 2. 返回限制长度的 Reader，直接指向 Value 数据
-        Ok(Some((v_len as u64, reader.take(v_len as u64))))
+        for (file_id, file) in self.file_list.iter().enumerate() {
+            let mut reader = std::io::BufReader::new(FileAtReader {
+                file: file,
+                offset: 0,
+            });
+            let mut count = 0;
+            loop {
+                println!("{count}");
+                count += 1;
+                let offset = reader.stream_position()?;
+                // 传入 &mut reader 修复类型错误
+                match decoder.decode_header_and_key(&mut reader) {
+                    Ok(Some(header)) => {
+                        self.map.insert(
+                            header.key,
+                            LogIndex::new(file_id as u32, offset, header.val_len),
+                        );
+                        // 由于decode_header_and_key中读取了值，计算CRC，所以不用Seek
+                    }
+                    Err(err) => match err {
+                        TitaniumError::CrcMismatch { expected } => {
+                            eprintln!(
+                                "File {} corrupted at offset {}: CRC mismatch (expected {})",
+                                file_id, offset, expected
+                            );
+                            // // 一旦 CRC 错位，后续数据很难恢复，通常选择截断或报错退出
+                            // return Err(err);
+                        }
+                        TitaniumError::Io(e) => match e.kind() {
+                            io::ErrorKind::UnexpectedEof => {
+                                println!(
+                                    "File {} ended unexpectedly (possibly truncated)",
+                                    file_id
+                                );
+                                file.set_len(offset)?;
+                                break; // 遇到 EOF 错误通常意味着文件结束，跳出循环
+                            }
+                            _ => (),
+                        },
+                        _ => (),
+                    },
+                    Ok(None) => break, // 文件结束
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -167,7 +227,7 @@ mod tests {
             fs::remove_dir_all(path).unwrap();
         }
 
-        let mut kv = KVStore::new(path.to_string()).unwrap();
+        let mut kv = KVStore::new(path).unwrap();
 
         // 测试写入和读取 (Set & Get)
         let key1 = "key1".to_string();
@@ -181,16 +241,6 @@ mod tests {
         // 测试读取不存在的 Key (Get Not Found)
         let res2 = kv.get("key2".to_string()).unwrap();
         assert!(res2.is_none());
-
-        // 测试流式读取 (Get Reader)
-        if let Some((len, mut reader)) = kv.get_reader("key1").unwrap() {
-            assert_eq!(len, val1.len() as u64);
-            let mut buf = Vec::new();
-            reader.read_to_end(&mut buf).unwrap();
-            assert_eq!(buf, val1);
-        } else {
-            panic!("get_reader failed to find key");
-        }
 
         // 清理测试数据
         fs::remove_dir_all(path).unwrap();

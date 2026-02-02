@@ -1,5 +1,6 @@
 /target
 *.log
+*.bs
 
 # Performance profiling
 perf.data

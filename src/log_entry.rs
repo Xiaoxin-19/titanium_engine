@@ -2,11 +2,20 @@ use crate::error::TitaniumError;
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{self, Read, Write};
 
+const MAX_KEY_SIZE: usize = 1024; // 1 KB
+const MAX_VALUE_SIZE: usize = 10 * 1024 * 1024; // 10 MB
+
 // log entry
 #[derive(Debug, Clone, PartialEq)]
 pub struct LogEntry {
     pub key: String,
     pub value: Vec<u8>,
+}
+
+pub struct LogHeader {
+    pub crc: u32,
+    pub key: String,
+    pub val_len: u32,
 }
 
 // zero allocation decoder
@@ -31,12 +40,12 @@ impl LogEntry {
         let v_len_size = encode_varint(v_len, &mut v_len_buf);
 
         // 1. First, calculate the CRC (including lengths and content)
-        let mut hasher = crc32fast::Hasher::new();
-        hasher.update(&k_len_buf[..k_len_size]);
-        hasher.update(&v_len_buf[..v_len_size]);
-        hasher.update(key.as_bytes());
-        hasher.update(value);
-        let crc = hasher.finalize();
+        let crc = generate_crc(
+            &k_len_buf[..k_len_size],
+            &v_len_buf[..v_len_size],
+            key,
+            value,
+        );
 
         // 2. Then write everything to the writer
         writer.write_u32::<LittleEndian>(crc)?;
@@ -64,7 +73,7 @@ impl Decoder {
         let v_len = decode_varint(reader)?;
 
         // Prevent attacks with excessively large entries
-        if k_len > 10 * 1024 * 1024 || v_len > 10 * 1024 * 1024 {
+        if k_len > MAX_KEY_SIZE as u32 || v_len > MAX_VALUE_SIZE as u32 {
             return Err(TitaniumError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Entry too large",
@@ -80,25 +89,8 @@ impl Decoder {
 
         // 2. Then verify the overall CRC
         // During verification, we directly use the data in the buffers to avoid cloning
-        let mut hasher = crc32fast::Hasher::new();
-
-        let mut k_len_buf = [0u8; 5];
-        let k_len_size = encode_varint(k_len, &mut k_len_buf);
-        hasher.update(&k_len_buf[..k_len_size]);
-
-        let mut v_len_buf = [0u8; 5];
-        let v_len_size = encode_varint(v_len, &mut v_len_buf);
-        hasher.update(&v_len_buf[..v_len_size]);
-
-        hasher.update(&self.key_buf);
-        hasher.update(&self.value_buf);
-
-        let calculated_crc = hasher.finalize();
-        if calculated_crc != crc {
-            return Err(TitaniumError::CrcMismatch {
-                expected: crc,
-                actual: calculated_crc,
-            });
+        if validate_crc(crc, k_len, v_len, &self.key_buf, &self.value_buf) {
+            return Err(TitaniumError::CrcMismatch { expected: crc });
         }
 
         // 3. Finally, construct the LogEntry without unnecessary cloning
@@ -116,27 +108,78 @@ impl Decoder {
     pub fn decode_header_and_key<R: Read>(
         &mut self,
         reader: &mut R,
-    ) -> Result<(u32, u32, String), TitaniumError> {
-        let crc = reader.read_u32::<LittleEndian>()?;
+    ) -> Result<Option<LogHeader>, TitaniumError> {
+        let mut crc_buf = [0u8; 4];
+        // 尝试读取第一个字节来判断 EOF
+        match reader.read(&mut crc_buf[0..1]) {
+            Ok(0) => return Ok(None), // Clean EOF
+            Ok(1) => reader.read_exact(&mut crc_buf[1..])?,
+            Ok(_) => unreachable!(),
+            Err(e) => return Err(TitaniumError::Io(e)),
+        }
+        let crc = u32::from_le_bytes(crc_buf);
         let k_len = decode_varint(reader)?;
         let v_len = decode_varint(reader)?;
 
-        // 同样进行大小检查
-        if k_len > 10 * 1024 * 1024 || v_len > 10 * 1024 * 1024 {
+        // 进行大小检查
+        if k_len > MAX_KEY_SIZE as u32 || v_len > MAX_VALUE_SIZE as u32 {
             return Err(TitaniumError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Entry too large",
             )));
         }
 
+        // 校验CRC
         self.key_buf.resize(k_len as usize, 0);
         reader.read_exact(&mut self.key_buf)?;
 
+        self.value_buf.resize(v_len as usize, 0);
+        reader.read_exact(&mut self.value_buf)?;
+        if validate_crc(crc, k_len, v_len, &self.key_buf, &self.value_buf) {
+            return Err(TitaniumError::CrcMismatch { expected: crc });
+        }
         let key = String::from_utf8(self.key_buf.clone())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Key is not valid UTF-8"))?;
 
-        Ok((v_len, crc, key))
+        Ok(Some(LogHeader {
+            crc,
+            key,
+            val_len: v_len,
+        }))
     }
+}
+
+pub fn validate_crc(
+    crc: u32,
+    k_len: u32,
+    v_len: u32,
+    key_buf: &Vec<u8>,
+    val_buf: &Vec<u8>,
+) -> bool {
+    let mut hasher = crc32fast::Hasher::new();
+
+    let mut k_len_buf = [0u8; 5];
+    let k_len_size = encode_varint(k_len, &mut k_len_buf);
+    hasher.update(&k_len_buf[..k_len_size]);
+
+    let mut v_len_buf = [0u8; 5];
+    let v_len_size = encode_varint(v_len, &mut v_len_buf);
+    hasher.update(&v_len_buf[..v_len_size]);
+
+    hasher.update(key_buf);
+    hasher.update(val_buf);
+
+    let calculated_crc = hasher.finalize();
+    return calculated_crc != crc;
+}
+
+pub fn generate_crc(key_len: &[u8], val_len: &[u8], key: &str, value: &[u8]) -> u32 {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(key_len);
+    hasher.update(val_len);
+    hasher.update(key.as_bytes());
+    hasher.update(value);
+    hasher.finalize()
 }
 
 /// Encodes a u32 integer into a variable-length format (Varint). returns the number of bytes written.
@@ -267,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_header_and_key() {
+    fn test_decode_header_and_key() -> Result<(), TitaniumError> {
         let key = "long_key";
         let value = vec![1u8; 100];
         let mut buf = Vec::new();
@@ -275,14 +318,19 @@ mod tests {
 
         let mut cursor = Cursor::new(buf);
         let mut decoder = Decoder::new();
-        let (v_len, _crc, decoded_key) = decoder.decode_header_and_key(&mut cursor).unwrap();
+        let log_header;
+        match decoder.decode_header_and_key(&mut cursor)? {
+            Some(header) => log_header = header,
+            None => panic!("Unexpected EOF"),
+        };
 
-        assert_eq!(decoded_key, key);
-        assert_eq!(v_len, 100);
+        assert_eq!(log_header.key, key);
+        assert_eq!(log_header.val_len, 100);
 
         // Verify cursor position (should be at the start of value)
         let mut remaining = Vec::new();
         cursor.read_to_end(&mut remaining).unwrap();
         assert_eq!(remaining, value);
+        Ok(())
     }
 }

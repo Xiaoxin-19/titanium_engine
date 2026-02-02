@@ -4,43 +4,76 @@ mod kv;
 mod log_entry;
 mod storage;
 mod writer;
-use std::fs::File;
-use std::io::{Seek, SeekFrom};
+
+use std::io::{self, Write};
 
 use crate::error::TitaniumError;
-use crate::log_entry::{Decoder, LogEntry};
-use crate::writer::Writer;
+use crate::kv::KVStore;
+
+const DATA_DIR: &str = "./data";
 
 fn main() -> Result<(), TitaniumError> {
-    let file = File::options()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open("output.log")?;
+    let mut kv_store = KVStore::new(DATA_DIR)?;
+    // restore or initialize the KV store as needed
+    kv_store.restore()?;
 
-    // use the Writer to write log entries to the file
-    let mut writer = Writer::new(file, 0);
+    println!("Welcome to Titanium KV Store!");
+    println!("Commands: SET <key> <value> | GET <key> | EXIT");
 
-    for i in 0..1000 {
-        let key = format!("key{}", i);
-        let value = vec![i as u8; 10];
-        let entry = LogEntry {
-            key,
-            value, // value is a vector of ten bytes, each set to i
-        };
-        let _ = writer.write_entry(&entry)?;
+    let mut input = String::new();
+    loop {
+        print!("> ");
+        io::stdout().flush()?;
+        input.clear();
+
+        match io::stdin().read_line(&mut input) {
+            Ok(0) => break, // EOF
+            Ok(_) => {
+                let trimmed = input.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+
+                let mut parts = trimmed.split_whitespace();
+                let command = parts.next().unwrap_or("").to_uppercase();
+
+                match command.as_str() {
+                    "SET" => {
+                        if let Some(key) = parts.next() {
+                            let value_parts: Vec<&str> = parts.collect();
+                            if value_parts.is_empty() {
+                                println!("Usage: SET <key> <value>");
+                            } else {
+                                let value = value_parts.join(" ");
+                                match kv_store.set(key.to_string(), value.into_bytes()) {
+                                    Ok(_) => println!("OK"),
+                                    Err(e) => eprintln!("Error: {}", e),
+                                }
+                            }
+                        } else {
+                            println!("Usage: SET <key> <value>");
+                        }
+                    }
+                    "GET" => {
+                        if let Some(key) = parts.next() {
+                            match kv_store.get(key.to_string()) {
+                                Ok(Some(entry)) => match String::from_utf8(entry.value) {
+                                    Ok(s) => println!("{}", s),
+                                    Err(e) => println!("{:?}", e.into_bytes()),
+                                },
+                                Ok(None) => println!("(nil)"),
+                                Err(e) => eprintln!("Error: {}", e),
+                            }
+                        } else {
+                            println!("Usage: GET <key>");
+                        }
+                    }
+                    "EXIT" => break,
+                    _ => println!("Unknown command: {}", command),
+                }
+            }
+            Err(e) => return Err(TitaniumError::Io(e)),
+        }
     }
-    writer.sync()?;
-
-    // --- validate  ---
-    let mut reader_file = File::options().read(true).open("output.log")?;
-    reader_file.seek(SeekFrom::Start(0))?; // 回到文件开头
-    let mut decoder = Decoder::new();
-
-    for i in 0..1000 {
-        let entry = decoder.decode_from(&mut reader_file)?;
-        assert_eq!(entry.key, format!("key{}", i));
-    }
-
     Ok(())
 }
