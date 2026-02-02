@@ -169,30 +169,39 @@ impl KVStore {
                 offset: 0,
             });
             loop {
-                let offset = reader.stream_position()?;
-                // 传入 &mut reader 修复类型错误
+                let offset = reader.stream_position()?; // 记录起始位置
                 match decoder.decode_header_and_key(&mut reader) {
+                    // 1. 完美读取
                     Ok(Some(header)) => {
                         self.map.insert(
                             header.key,
                             LogIndex::new(file_id as u32, offset, header.val_len),
                         );
-                        // 由于decode_header_and_key中读取了值，计算CRC，所以不用Seek
                     }
-                    Err(err) => match err {
-                        TitaniumError::CrcMismatch { .. } => {
-                            // CRC mismatch implies data corruption or partial write at the end.
-                            // We truncate the file to the last valid offset to allow recovery.
-                            file.set_len(offset)?;
-                            break;
-                        }
-                        TitaniumError::Io(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                            file.set_len(offset)?;
-                            break;
-                        }
-                        _ => return Err(err),
-                    },
-                    Ok(None) => break, // 文件结束
+
+                    // 2. 完美结束 (EOF)
+                    Ok(None) => break,
+
+                    // 3. 数据损坏 (CRC 错 或 意外EOF) -> 执行截断
+                    Err(TitaniumError::CrcMismatch { .. }) => {
+                        eprintln!(
+                            "Recover: Corrupted data at file {} offset {}. Truncating.",
+                            file_id, offset
+                        );
+                        file.set_len(offset)?; // 截断到最后一次好的位置
+                        break; // 停止处理当前文件
+                    }
+                    Err(TitaniumError::Io(ref e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                        eprintln!(
+                            "Recover: Corrupted data at file {} offset {}. Truncating.",
+                            file_id, offset
+                        );
+                        file.set_len(offset)?; // 截断到最后一次好的位置
+                        break; // 停止处理当前文件
+                    }
+
+                    // 4. 其他严重 I/O 错误 (如磁盘坏道、权限不足) -> 必须抛出
+                    Err(e) => return Err(e),
                 }
             }
         }
