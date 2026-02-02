@@ -48,7 +48,10 @@ impl LogEntry {
         );
 
         // 2. Then write everything to the writer
-        writer.write_u32::<LittleEndian>(crc)?;
+        // TODO: consider using write_all_vectored for efficiency
+        // TODO: consider use two crc ，one header one data
+        // TODO: allocate a buffer to combine these writes to reduce syscalls
+        writer.write_all(&crc.to_le_bytes())?;
         writer.write_all(&k_len_buf[..k_len_size])?;
         writer.write_all(&v_len_buf[..v_len_size])?;
         writer.write_all(key.as_bytes())?;

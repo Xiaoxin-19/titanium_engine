@@ -168,10 +168,7 @@ impl KVStore {
                 file: file,
                 offset: 0,
             });
-            let mut count = 0;
             loop {
-                println!("{count}");
-                count += 1;
                 let offset = reader.stream_position()?;
                 // 传入 &mut reader 修复类型错误
                 match decoder.decode_header_and_key(&mut reader) {
@@ -183,26 +180,17 @@ impl KVStore {
                         // 由于decode_header_and_key中读取了值，计算CRC，所以不用Seek
                     }
                     Err(err) => match err {
-                        TitaniumError::CrcMismatch { expected } => {
-                            eprintln!(
-                                "File {} corrupted at offset {}: CRC mismatch (expected {})",
-                                file_id, offset, expected
-                            );
-                            // // 一旦 CRC 错位，后续数据很难恢复，通常选择截断或报错退出
-                            // return Err(err);
+                        TitaniumError::CrcMismatch { .. } => {
+                            // CRC mismatch implies data corruption or partial write at the end.
+                            // We truncate the file to the last valid offset to allow recovery.
+                            file.set_len(offset)?;
+                            break;
                         }
-                        TitaniumError::Io(e) => match e.kind() {
-                            io::ErrorKind::UnexpectedEof => {
-                                println!(
-                                    "File {} ended unexpectedly (possibly truncated)",
-                                    file_id
-                                );
-                                file.set_len(offset)?;
-                                break; // 遇到 EOF 错误通常意味着文件结束，跳出循环
-                            }
-                            _ => (),
-                        },
-                        _ => (),
+                        TitaniumError::Io(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                            file.set_len(offset)?;
+                            break;
+                        }
+                        _ => return Err(err),
                     },
                     Ok(None) => break, // 文件结束
                 }
@@ -216,7 +204,6 @@ impl KVStore {
 mod tests {
     use super::*;
     use std::fs;
-    use std::io::Read;
     use std::path::Path;
 
     #[test]
