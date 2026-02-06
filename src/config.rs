@@ -21,6 +21,7 @@ pub const DEFAULT_DATA_DIR_PATH: &str = "./data";
 pub const DEFAULT_MAX_KEY_SIZE: usize = 1024; // 1 KB
 pub const DEFAULT_MAX_VALUE_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 pub const DEFAULT_WRITE_MOD: WriteMod = WriteMod::Sync;
+pub const DEFAULT_MAX_FILE_SIZE: usize = 1073741824; // 1GB
 static GLOBAL_WATCHER: OnceLock<ConfigWatcher> = OnceLock::new();
 
 #[derive(Debug, Clone)]
@@ -30,6 +31,7 @@ pub struct Config {
     pub max_key_size: usize,
     pub max_val_size: usize,
     pub write_mod: WriteMod,
+    pub max_file_size: usize,
 }
 
 impl Config {
@@ -40,6 +42,7 @@ impl Config {
             max_key_size: DEFAULT_MAX_KEY_SIZE,
             max_val_size: DEFAULT_MAX_VALUE_SIZE,
             write_mod: DEFAULT_WRITE_MOD,
+            max_file_size: DEFAULT_MAX_FILE_SIZE,
         }
     }
 
@@ -49,6 +52,9 @@ impl Config {
         }
         if self.max_val_size == 0 {
             return Err("max_val_size must be greater than 0".to_string());
+        }
+        if self.max_file_size == 0 {
+            return Err("max_file_size must be greater than 0".to_string());
         }
         Ok(())
     }
@@ -108,6 +114,7 @@ impl Config {
     }
 }
 
+#[derive(Clone)]
 pub struct ConfigWatcher {
     inner: Arc<RwLock<Config>>,
     running: Arc<AtomicBool>,
@@ -204,9 +211,20 @@ impl ConfigWatcher {
         (guard.max_key_size, guard.max_val_size)
     }
 
+    pub fn max_file_size(&self) -> usize {
+        let guard = self.inner.read().expect("Config lock poisoned");
+        guard.max_file_size
+    }
+
     /// 停止后台监控线程
     pub fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
+    }
+
+    /// 允许在运行时（主要是测试中）覆盖全局配置
+    /// 注意：这会影响所有使用 ConfigWatcher::global() 的组件
+    pub fn override_config(&self, new_config: Config) {
+        *self.inner.write().expect("Config lock poisoned") = new_config;
     }
 }
 

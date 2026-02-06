@@ -16,8 +16,8 @@ use crate::kv::KVStore;
 
 fn main() -> Result<(), TitaniumError> {
     ConfigWatcher::init(DEFAULT_CONFIG_FILE)?;
-    let config = ConfigWatcher::current();
-    let mut kv_store = KVStore::new(&config.data_dir)?;
+    let watcher = ConfigWatcher::global().clone();
+    let mut kv_store = KVStore::new(watcher)?;
     // restore or initialize the KV store as needed
     kv_store.restore()?;
 

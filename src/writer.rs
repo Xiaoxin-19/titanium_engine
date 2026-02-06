@@ -26,6 +26,15 @@ impl<W: Storage> Writer<W> {
         Ok(offset)
     }
 
+    pub fn current_offset(&self) -> u64 {
+        self.current_offset
+    }
+
+    // 获取内部 writer 的引用，用于读取
+    pub fn get_ref(&self) -> &W {
+        self.writer.get_ref()
+    }
+
     // ⚡️ 真正的落盘 (慢，安全)
     // 通常仅在事务提交或关键数据写入时调用
     pub fn sync(&mut self) -> Result<(), TitaniumError> {
@@ -34,5 +43,16 @@ impl<W: Storage> Writer<W> {
         // 2. 再命令内核推给磁盘
         self.writer.get_mut().sync()?;
         Ok(())
+    }
+
+    // 仅刷新到操作系统缓存 (快，保证 Read-Your-Writes 可见性)
+    pub fn flush_to_os(&mut self) -> Result<(), TitaniumError> {
+        self.writer.flush()?;
+        Ok(())
+    }
+
+    // 供 KVStore::restore 使用：当发现 active file 数据损坏并截断后，需要修正内存中的 offset
+    pub(crate) fn set_offset(&mut self, offset: u64) {
+        self.current_offset = offset;
     }
 }
