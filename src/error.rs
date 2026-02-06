@@ -10,4 +10,7 @@ pub enum TitaniumError {
 
     #[error("Varint Decode Error")]
     VarintDecodeError,
+
+    #[error("Config Error: {0}")]
+    ConfigError(String),
 }

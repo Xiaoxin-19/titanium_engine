@@ -1,19 +1,23 @@
+mod compaction;
+mod config;
 mod error;
 mod index;
 mod kv;
 mod log_entry;
 mod storage;
+mod utils;
 mod writer;
 
 use std::io::{self, Write};
 
+use crate::config::{ConfigWatcher, DEFAULT_CONFIG_FILE};
 use crate::error::TitaniumError;
 use crate::kv::KVStore;
 
-const DATA_DIR: &str = "./data";
-
 fn main() -> Result<(), TitaniumError> {
-    let mut kv_store = KVStore::new(DATA_DIR)?;
+    ConfigWatcher::init(DEFAULT_CONFIG_FILE)?;
+    let config = ConfigWatcher::current();
+    let mut kv_store = KVStore::new(&config.data_dir)?;
     // restore or initialize the KV store as needed
     kv_store.restore()?;
 

@@ -1,9 +1,9 @@
-use crate::error::TitaniumError;
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use crate::{
+    error::TitaniumError,
+    utils::{decode_varint, encode_varint, generate_crc, validate_crc},
+};
+use byteorder::{LittleEndian, ReadBytesExt};
 use std::io::{self, Read, Write};
-
-const MAX_KEY_SIZE: usize = 1024; // 1 KB
-const MAX_VALUE_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 
 // log entry
 #[derive(Debug, Clone, PartialEq)]
@@ -22,6 +22,8 @@ pub struct LogHeader {
 pub struct Decoder {
     key_buf: Vec<u8>,
     value_buf: Vec<u8>,
+    max_key_size: usize,
+    max_val_size: usize,
 }
 
 impl LogEntry {
@@ -63,11 +65,18 @@ impl LogEntry {
 }
 
 impl Decoder {
-    pub fn new() -> Self {
+    pub fn new(max_key_size: usize, max_val_size: usize) -> Self {
         Decoder {
             key_buf: Vec::new(),
             value_buf: Vec::new(),
+            max_key_size,
+            max_val_size,
         }
+    }
+
+    pub fn set_limits(&mut self, max_key_size: usize, max_val_size: usize) {
+        self.max_key_size = max_key_size;
+        self.max_val_size = max_val_size;
     }
 
     pub fn decode_from<R: Read>(&mut self, reader: &mut R) -> Result<LogEntry, TitaniumError> {
@@ -76,7 +85,7 @@ impl Decoder {
         let v_len = decode_varint(reader)?;
 
         // Prevent attacks with excessively large entries
-        if k_len > MAX_KEY_SIZE as u32 || v_len > MAX_VALUE_SIZE as u32 {
+        if k_len > self.max_key_size as u32 || v_len > self.max_val_size as u32 {
             return Err(TitaniumError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Entry too large",
@@ -106,8 +115,8 @@ impl Decoder {
         })
     }
 
-    /// 仅解码头部和 Key，返回 (Value长度, Key)，并将 Reader 指针停留在 Value 的起始位置。
-    /// 用于流式读取 Value。
+    /// 解码头部、Key 和 Value 以进行 CRC 校验，但仅返回头部信息 (CRC, Key, Value长度)。
+    /// 注意：此方法会消耗 Reader 中的 Value 数据以验证完整性。
     pub fn decode_header_and_key<R: Read>(
         &mut self,
         reader: &mut R,
@@ -125,7 +134,7 @@ impl Decoder {
         let v_len = decode_varint(reader)?;
 
         // 进行大小检查
-        if k_len > MAX_KEY_SIZE as u32 || v_len > MAX_VALUE_SIZE as u32 {
+        if k_len > self.max_key_size as u32 || v_len > self.max_val_size as u32 {
             return Err(TitaniumError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Entry too large",
@@ -149,98 +158,6 @@ impl Decoder {
             key,
             val_len: v_len,
         }))
-    }
-}
-
-pub fn validate_crc(
-    crc: u32,
-    k_len: u32,
-    v_len: u32,
-    key_buf: &Vec<u8>,
-    val_buf: &Vec<u8>,
-) -> bool {
-    let mut hasher = crc32fast::Hasher::new();
-
-    let mut k_len_buf = [0u8; 5];
-    let k_len_size = encode_varint(k_len, &mut k_len_buf);
-    hasher.update(&k_len_buf[..k_len_size]);
-
-    let mut v_len_buf = [0u8; 5];
-    let v_len_size = encode_varint(v_len, &mut v_len_buf);
-    hasher.update(&v_len_buf[..v_len_size]);
-
-    hasher.update(key_buf);
-    hasher.update(val_buf);
-
-    let calculated_crc = hasher.finalize();
-    return calculated_crc != crc;
-}
-
-pub fn generate_crc(key_len: &[u8], val_len: &[u8], key: &str, value: &[u8]) -> u32 {
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(key_len);
-    hasher.update(val_len);
-    hasher.update(key.as_bytes());
-    hasher.update(value);
-    hasher.finalize()
-}
-
-/// Encodes a u32 integer into a variable-length format (Varint). returns the number of bytes written.
-///
-/// # Example: Encoding 300
-///
-/// ```text
-/// 300 in binary:  0000 0001 0010 1100
-/// First byte:     1010 1100 (0xAC) -> lower 7 bits + continuation bit
-/// Second byte:    0000 0010 (0x02) -> remaining bits
-/// Result:         0xAC02
-/// ```
-pub fn encode_varint(mut n: u32, buf: &mut [u8]) -> usize {
-    let mut counter = 0;
-    loop {
-        let mut b = (n & 0x7F) as u8;
-        n >>= 7;
-        if n != 0 {
-            b |= 0x80;
-        }
-        buf[counter] = b;
-        counter += 1;
-        if n == 0 {
-            break;
-        }
-    }
-    counter
-}
-
-/// Decodes a variable-length integer (Varint) from a reader. returns the decoded u32.
-///
-/// # Example: Decoding 300 from 0xAC, 0x02
-///
-/// ```text
-/// Byte 0: 1010 1100 (0xAC)
-/// Keep 7: 010 1100
-/// Result: 0000 0000 0010 1100 (44)
-/// Continuation: Yes
-///
-/// Byte 1: 0000 0010 (0x02)
-/// Keep 7: 000 0010
-/// Shift 7: 1 0000 0000 (256)
-/// Result: 1 0010 1100 (300)
-/// Continuation: No
-/// ```
-fn decode_varint<R: Read>(reader: &mut R) -> Result<u32, TitaniumError> {
-    let mut result = 0;
-    let mut shift = 0;
-    loop {
-        if shift > 28 {
-            return Err(TitaniumError::VarintDecodeError);
-        }
-        let byte = reader.read_u8()?;
-        result |= ((byte & 0x7F) as u32) << shift;
-        if byte & 0x80 == 0 {
-            return Ok(result);
-        }
-        shift += 7;
     }
 }
 
@@ -284,7 +201,7 @@ mod tests {
 
         // Decode
         let mut cursor = Cursor::new(buf);
-        let mut decoder = Decoder::new();
+        let mut decoder = Decoder::new(1024, 1024 * 1024);
         let entry = decoder.decode_from(&mut cursor).unwrap();
 
         assert_eq!(entry.key, key);
@@ -303,7 +220,7 @@ mod tests {
         buf[len - 1] ^= 0xFF;
 
         let mut cursor = Cursor::new(buf);
-        let mut decoder = Decoder::new();
+        let mut decoder = Decoder::new(1024, 1024 * 1024);
         let err = decoder.decode_from(&mut cursor).unwrap_err();
 
         match err {
@@ -320,7 +237,7 @@ mod tests {
         LogEntry::encode_to(key, &value, &mut buf).unwrap();
 
         let mut cursor = Cursor::new(buf);
-        let mut decoder = Decoder::new();
+        let mut decoder = Decoder::new(1024, 1024 * 1024);
         let log_header;
         match decoder.decode_header_and_key(&mut cursor)? {
             Some(header) => log_header = header,
@@ -330,10 +247,13 @@ mod tests {
         assert_eq!(log_header.key, key);
         assert_eq!(log_header.val_len, 100);
 
-        // Verify cursor position (should be at the start of value)
+        // Verify cursor position (should be at the END of value, because we consumed it for CRC check)
         let mut remaining = Vec::new();
         cursor.read_to_end(&mut remaining).unwrap();
-        assert_eq!(remaining, value);
+        assert!(
+            remaining.is_empty(),
+            "Cursor should be at the end of the entry"
+        );
         Ok(())
     }
 }
