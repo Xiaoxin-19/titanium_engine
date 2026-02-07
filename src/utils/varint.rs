@@ -4,17 +4,35 @@ use byteorder::ReadBytesExt;
 
 use crate::error::TitaniumError;
 
-/// Encodes a u32 integer into a variable-length format (Varint). returns the number of bytes written.
-///
-/// # Example: Encoding 300
-///
-/// ```text
-/// 300 in binary:  0000 0001 0010 1100
-/// First byte:     1010 1100 (0xAC) -> lower 7 bits + continuation bit
-/// Second byte:    0000 0010 (0x02) -> remaining bits
-/// Result:         0xAC02
-/// ```
-pub fn encode_varint(mut n: u32, buf: &mut [u8]) -> usize {
+pub trait Varint: Sized + Copy {
+    fn to_u64(self) -> u64;
+    fn from_u64(v: u64) -> Self;
+    const MAX_SHIFT: usize;
+}
+
+impl Varint for u32 {
+    fn to_u64(self) -> u64 {
+        self as u64
+    }
+    fn from_u64(v: u64) -> Self {
+        v as u32
+    }
+    const MAX_SHIFT: usize = 28;
+}
+
+impl Varint for u64 {
+    fn to_u64(self) -> u64 {
+        self
+    }
+    fn from_u64(v: u64) -> Self {
+        v
+    }
+    const MAX_SHIFT: usize = 63;
+}
+
+/// Encodes an integer into a variable-length format (Varint). returns the number of bytes written.
+pub fn encode_varint<T: Varint>(n: T, buf: &mut [u8]) -> usize {
+    let mut n = n.to_u64();
     let mut counter = 0;
     loop {
         let mut b = (n & 0x7F) as u8;
@@ -31,33 +49,18 @@ pub fn encode_varint(mut n: u32, buf: &mut [u8]) -> usize {
     counter
 }
 
-/// Decodes a variable-length integer (Varint) from a reader. returns the decoded u32.
-///
-/// # Example: Decoding 300 from 0xAC, 0x02
-///
-/// ```text
-/// Byte 0: 1010 1100 (0xAC)
-/// Keep 7: 010 1100
-/// Result: 0000 0000 0010 1100 (44)
-/// Continuation: Yes
-///
-/// Byte 1: 0000 0010 (0x02)
-/// Keep 7: 000 0010
-/// Shift 7: 1 0000 0000 (256)
-/// Result: 1 0010 1100 (300)
-/// Continuation: No
-/// ```
-pub fn decode_varint<R: Read>(reader: &mut R) -> Result<u32, TitaniumError> {
-    let mut result = 0;
+/// Decodes a variable-length integer (Varint) from a reader.
+pub fn decode_varint<R: Read, T: Varint>(reader: &mut R) -> Result<T, TitaniumError> {
+    let mut result = 0u64;
     let mut shift = 0;
     loop {
-        if shift > 28 {
+        if shift > T::MAX_SHIFT {
             return Err(TitaniumError::VarintDecodeError);
         }
         let byte = reader.read_u8()?;
-        result |= ((byte & 0x7F) as u32) << shift;
+        result |= ((byte & 0x7F) as u64) << shift;
         if byte & 0x80 == 0 {
-            return Ok(result);
+            return Ok(T::from_u64(result));
         }
         shift += 7;
     }

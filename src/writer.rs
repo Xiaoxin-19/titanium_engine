@@ -12,16 +12,21 @@ pub struct Writer<W: Storage> {
 impl<W: Storage> Writer<W> {
     pub fn new(inner: W, offset: u64) -> Self {
         Self {
+            // TODO: [File Header] Write a fixed-length header at the beginning of new files (offset == 0).
+            // Layout: MagicNumber(4B) + Version(1B) + EncryptionSalt(Optional).
+            // Example: b"TITN" + 0x01
+            // This helps in identifying valid data files and handling format migrations.
             writer: io::BufWriter::new(inner),
             current_offset: offset,
             // 💡 思考：如果是追加模式，这里应该 seek 到文件末尾获取初始 offset
+            // TODO: Ensure the inner writer is actually at the correct offset if appending to an existing file.
             // 但目前 Day 2 假设新文件，0 是可以的。
         }
     }
 
     pub fn write_entry(&mut self, entry: &LogEntry) -> Result<u64, TitaniumError> {
         let offset = self.current_offset;
-        let bytes_written = LogEntry::encode_to(&entry.key, &entry.value, &mut self.writer)?;
+        let bytes_written = entry.encode_to(&mut self.writer)?;
         self.current_offset += bytes_written;
         Ok(offset)
     }

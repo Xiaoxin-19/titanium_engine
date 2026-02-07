@@ -16,7 +16,6 @@ pub enum WriteMod {
 }
 
 pub const DEFAULT_CONFIG_FILE: &str = "titanium.conf";
-pub const DEFAULT_HINT_FILE: &str = "hint.hbs";
 pub const DEFAULT_DATA_DIR_PATH: &str = "./data";
 pub const DEFAULT_MAX_KEY_SIZE: usize = 1024; // 1 KB
 pub const DEFAULT_MAX_VALUE_SIZE: usize = 10 * 1024 * 1024; // 10 MB
@@ -27,7 +26,6 @@ static GLOBAL_WATCHER: OnceLock<ConfigWatcher> = OnceLock::new();
 #[derive(Debug, Clone)]
 pub struct Config {
     pub data_dir: String,
-    pub hint_file: String,
     pub max_key_size: usize,
     pub max_val_size: usize,
     pub write_mod: WriteMod,
@@ -38,7 +36,6 @@ impl Config {
     fn default() -> Self {
         Self {
             data_dir: DEFAULT_DATA_DIR_PATH.to_string(),
-            hint_file: DEFAULT_HINT_FILE.to_string(),
             max_key_size: DEFAULT_MAX_KEY_SIZE,
             max_val_size: DEFAULT_MAX_VALUE_SIZE,
             write_mod: DEFAULT_WRITE_MOD,
@@ -74,7 +71,6 @@ impl Config {
             if let Some((key, value)) = line.split_once('=') {
                 match key.trim() {
                     "data_dir" => config.data_dir = value.trim().to_string(),
-                    "hint_file" => config.hint_file = value.trim().to_string(),
                     "max_key_size" => {
                         config.max_key_size = value.trim().parse().map_err(|e| {
                             TitaniumError::ConfigError(format!(

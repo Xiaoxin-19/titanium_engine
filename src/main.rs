@@ -9,20 +9,23 @@ mod utils;
 mod writer;
 
 use std::io::{self, Write};
+use std::sync::Arc;
 
 use crate::config::{ConfigWatcher, DEFAULT_CONFIG_FILE};
 use crate::error::TitaniumError;
 use crate::kv::KVStore;
+use crate::storage::OsFileSystem;
 
 fn main() -> Result<(), TitaniumError> {
     ConfigWatcher::init(DEFAULT_CONFIG_FILE)?;
     let watcher = ConfigWatcher::global().clone();
-    let mut kv_store = KVStore::new(watcher)?;
+    let fs = Arc::new(OsFileSystem);
+    let mut kv_store = KVStore::new(watcher, fs)?;
     // restore or initialize the KV store as needed
     kv_store.restore()?;
 
     println!("Welcome to Titanium KV Store!");
-    println!("Commands: SET <key> <value> | GET <key> | EXIT");
+    println!("Commands: SET <key> <value> | GET <key> | RM <key> | EXIT");
 
     let mut input = String::new();
     loop {
@@ -70,6 +73,16 @@ fn main() -> Result<(), TitaniumError> {
                             }
                         } else {
                             println!("Usage: GET <key>");
+                        }
+                    }
+                    "RM" => {
+                        if let Some(key) = parts.next() {
+                            match kv_store.remove(key) {
+                                Ok(_) => println!("OK"),
+                                Err(e) => eprintln!("Error: {}", e),
+                            }
+                        } else {
+                            println!("Usage: RM <key>");
                         }
                     }
                     "EXIT" => break,
