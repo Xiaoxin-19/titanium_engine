@@ -1,5 +1,6 @@
-use std::collections::{HashMap, hash_map::DefaultHasher};
-use std::hash::{Hash, Hasher};
+use hashbrown::HashTable;
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hash, Hasher};
 
 /// 索引器接口：负责管理 Key 到 LogIndex 的映射
 pub trait Indexer: Send + Sync {
@@ -44,70 +45,73 @@ struct KeyRef {
     len: u32,
 }
 
-/// 内存布局优化：HashMap<u64, Vec<(KeyRef, LogIndex)>>
 pub struct HashIndexer {
-    // 存储 hash(key) -> 冲突链表
-    map: HashMap<u64, Vec<(KeyRef, LogIndex)>>,
+    table: HashTable<(KeyRef, LogIndex)>,
     arena: KeyArena,
+    hasher_builder: RandomState,
 }
 
 impl HashIndexer {
     pub fn new() -> Self {
         Self {
-            map: HashMap::new(),
+            table: HashTable::new(),
             arena: KeyArena::new(),
+            hasher_builder: RandomState::new(),
         }
     }
 
-    fn hash_key(key: &str) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        key.hash(&mut hasher);
+    fn hash_key(&self, key: &str) -> u64 {
+        let mut hasher = self.hasher_builder.build_hasher();
+        key.as_bytes().hash(&mut hasher);
         hasher.finish()
+    }
+
+    /// [Test Helper] 估算当前索引的内存占用 (Bytes)
+    #[cfg(test)]
+    pub fn memory_usage_approx(&self) -> usize {
+        let table_mem = self.table.capacity() * std::mem::size_of::<(KeyRef, LogIndex)>();
+        let arena_mem = self.arena.data.capacity();
+        table_mem + arena_mem
     }
 }
 
 impl Indexer for HashIndexer {
     fn put(&mut self, key: String, index: LogIndex) {
-        let hash = Self::hash_key(&key);
-        let key_ref = self.arena.alloc(&key);
+        let hash = self.hash_key(&key);
 
-        let bucket = self.map.entry(hash).or_insert_with(Vec::new);
-
-        // 检查是否存在相同的 Key (更新操作)
-        for item in bucket.iter_mut() {
-            if self.arena.get(item.0) == key.as_bytes() {
-                item.1 = index;
-                return;
-            }
+        if let Some((_, val)) = self
+            .table
+            .find_mut(hash, |(kref, _)| self.arena.get(*kref) == key.as_bytes())
+        {
+            *val = index;
+            return;
         }
 
-        // 如果是新 Key，追加到链表
-        bucket.push((key_ref, index));
+        let key_ref = self.arena.alloc(&key);
+
+        self.table
+            .insert_unique(hash, (key_ref, index), |(kref, _)| {
+                let bytes = self.arena.get(*kref);
+                let mut hasher = self.hasher_builder.build_hasher();
+                bytes.hash(&mut hasher);
+                hasher.finish()
+            });
     }
 
     fn get(&self, key: &str) -> Option<LogIndex> {
-        let hash = Self::hash_key(key);
-        if let Some(bucket) = self.map.get(&hash) {
-            // 遍历冲突链表，比较实际的 Key 内容
-            for (key_ref, index) in bucket {
-                if self.arena.get(*key_ref) == key.as_bytes() {
-                    return Some(*index);
-                }
-            }
-        }
-        None
+        let hash = self.hash_key(key);
+        self.table
+            .find(hash, |(kref, _)| self.arena.get(*kref) == key.as_bytes())
+            .map(|(_, val)| *val)
     }
 
     fn remove(&mut self, key: &str) {
-        let hash = Self::hash_key(key);
-        if let Some(bucket) = self.map.get_mut(&hash) {
-            // 从 Vec 中移除对应的 Key
-            bucket.retain(|(key_ref, _)| self.arena.get(*key_ref) != key.as_bytes());
-
-            // 如果桶空了，移除 Key 以节省 HashMap 空间
-            if bucket.is_empty() {
-                self.map.remove(&hash);
-            }
+        let hash = self.hash_key(key);
+        if let Ok(entry) = self
+            .table
+            .find_entry(hash, |(kref, _)| self.arena.get(*kref) == key.as_bytes())
+        {
+            entry.remove();
         }
     }
 }
@@ -132,10 +136,11 @@ impl LogIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::time::Instant;
 
     #[test]
     fn test_index_entry_size() {
-        // 打印 LogIndex 的内存大小
         println!(
             "Size of LogIndex: {} bytes",
             std::mem::size_of::<LogIndex>()
@@ -204,5 +209,106 @@ mod tests {
             let expected = LogIndex::new(1, i, 10);
             assert_eq!(indexer.get(&key), Some(expected));
         }
+    }
+
+    #[test]
+    #[ignore] // 默认忽略此测试，因为耗时较长。运行命令: cargo test --release -- --nocapture --ignored
+    fn benchmark_memory_and_performance() {
+        // 1. 定义基准对照组 (Standard HashMap)
+        struct StandardHashMapIndexer {
+            map: HashMap<String, LogIndex>,
+        }
+
+        impl StandardHashMapIndexer {
+            fn new() -> Self {
+                Self {
+                    map: HashMap::new(),
+                }
+            }
+        }
+
+        impl Indexer for StandardHashMapIndexer {
+            fn put(&mut self, key: String, index: LogIndex) {
+                self.map.insert(key, index);
+            }
+            fn get(&self, key: &str) -> Option<LogIndex> {
+                self.map.get(key).copied()
+            }
+            fn remove(&mut self, key: &str) {
+                self.map.remove(key);
+            }
+        }
+
+        // 2. 准备测试数据
+        let n = 1_000_000; // 100万 keys
+        println!("Generating {} keys...", n);
+        let keys: Vec<String> = (0..n).map(|i| format!("key-{:010}", i)).collect();
+        let idx = LogIndex::new(1, 0, 0);
+
+        // 3. 测试 HashIndexer (Arena + RawTable)
+        println!("\n--- Testing HashIndexer (Arena) ---");
+        let mut arena_indexer = HashIndexer::new();
+
+        let start = Instant::now();
+        for key in &keys {
+            arena_indexer.put(key.clone(), idx);
+        }
+        let put_duration_arena = start.elapsed();
+        println!("Put time: {:?}", put_duration_arena);
+
+        let start = Instant::now();
+        for key in &keys {
+            arena_indexer.get(key);
+        }
+        let get_duration_arena = start.elapsed();
+        println!("Get time: {:?}", get_duration_arena);
+
+        let mem_arena = arena_indexer.memory_usage_approx();
+        println!(
+            "Approx Memory: {:.2} MB",
+            mem_arena as f64 / 1024.0 / 1024.0
+        );
+
+        // 4. 测试 Standard HashMap
+        println!("\n--- Testing Standard HashMap ---");
+        let mut std_indexer = StandardHashMapIndexer::new();
+
+        let start = Instant::now();
+        for key in &keys {
+            std_indexer.put(key.clone(), idx);
+        }
+        let put_duration_std = start.elapsed();
+        println!("Put time: {:?}", put_duration_std);
+
+        let start = Instant::now();
+        for key in &keys {
+            std_indexer.get(key);
+        }
+        let get_duration_std = start.elapsed();
+        println!("Get time: {:?}", get_duration_std);
+
+        // 估算 HashMap 内存: Capacity * (SizeOf(String) + SizeOf(LogIndex)) + Heap(Strings)
+        // String(24B) + LogIndex(16B) = 40B per entry (stack)
+        let map_cap = std_indexer.map.capacity();
+        let struct_overhead = std::mem::size_of::<String>() + std::mem::size_of::<LogIndex>();
+        // 粗略估算：所有 Key 的堆内存占用 (String content)
+        let heap_size: usize = keys.iter().map(|k| k.capacity()).sum();
+        let mem_std = map_cap * struct_overhead + heap_size;
+        println!("Approx Memory: {:.2} MB", mem_std as f64 / 1024.0 / 1024.0);
+
+        // 5. 总结对比
+        println!("\n--- Comparison ---");
+        println!(
+            "Memory Savings: {:.2}%",
+            (1.0 - mem_arena as f64 / mem_std as f64) * 100.0
+        );
+        println!(
+            "Put Speedup: {:.2}x",
+            put_duration_std.as_secs_f64() / put_duration_arena.as_secs_f64()
+        );
+        println!(
+            "Get Speedup: {:.2}x",
+            get_duration_std.as_secs_f64() / get_duration_arena.as_secs_f64()
+        );
     }
 }
