@@ -21,6 +21,11 @@ pub const DEFAULT_MAX_KEY_SIZE: usize = 1024; // 1 KB
 pub const DEFAULT_MAX_VALUE_SIZE: usize = 10 * 1024 * 1024; // 10 MB
 pub const DEFAULT_WRITE_MOD: WriteMod = WriteMod::Sync;
 pub const DEFAULT_MAX_FILE_SIZE: usize = 1073741824; // 1GB
+pub const DEFAULT_COMPACTION_THRESHOLD: usize = 4;
+pub const DEFAULT_WRITE_STALL_THRESHOLD: usize = 8;
+pub const DEFAULT_WRITE_STOP_THRESHOLD: usize = 20;
+pub const DEFAULT_COMPACTION_CHECK_INTERVAL_MS: u64 = 60_000; // 1 minute
+pub const DEFAULT_MIN_FREE_SPACE: u64 = 1024 * 1024 * 1024; // 1 GB
 static GLOBAL_WATCHER: OnceLock<ConfigWatcher> = OnceLock::new();
 
 #[derive(Debug, Clone)]
@@ -30,6 +35,11 @@ pub struct Config {
     pub max_val_size: usize,
     pub write_mod: WriteMod,
     pub max_file_size: usize,
+    pub compaction_threshold: usize,
+    pub write_stall_threshold: usize,
+    pub write_stop_threshold: usize,
+    pub compaction_check_interval_ms: u64,
+    pub min_free_space: u64,
 }
 
 impl Config {
@@ -40,6 +50,11 @@ impl Config {
             max_val_size: DEFAULT_MAX_VALUE_SIZE,
             write_mod: DEFAULT_WRITE_MOD,
             max_file_size: DEFAULT_MAX_FILE_SIZE,
+            compaction_threshold: DEFAULT_COMPACTION_THRESHOLD,
+            write_stall_threshold: DEFAULT_WRITE_STALL_THRESHOLD,
+            write_stop_threshold: DEFAULT_WRITE_STOP_THRESHOLD,
+            compaction_check_interval_ms: DEFAULT_COMPACTION_CHECK_INTERVAL_MS,
+            min_free_space: DEFAULT_MIN_FREE_SPACE,
         }
     }
 
@@ -52,6 +67,11 @@ impl Config {
         }
         if self.max_file_size == 0 {
             return Err("max_file_size must be greater than 0".to_string());
+        }
+        if self.write_stop_threshold <= self.write_stall_threshold {
+            return Err(
+                "write_stop_threshold must be greater than write_stall_threshold".to_string(),
+            );
         }
         Ok(())
     }
@@ -97,6 +117,47 @@ impl Config {
                             )));
                         }
                     },
+                    "compaction_threshold" => {
+                        config.compaction_threshold = value.trim().parse().map_err(|e| {
+                            TitaniumError::ConfigError(format!(
+                                "Invalid compaction_threshold '{}': {}",
+                                value, e
+                            ))
+                        })?;
+                    }
+                    "write_stall_threshold" => {
+                        config.write_stall_threshold = value.trim().parse().map_err(|e| {
+                            TitaniumError::ConfigError(format!(
+                                "Invalid write_stall_threshold '{}': {}",
+                                value, e
+                            ))
+                        })?;
+                    }
+                    "write_stop_threshold" => {
+                        config.write_stop_threshold = value.trim().parse().map_err(|e| {
+                            TitaniumError::ConfigError(format!(
+                                "Invalid write_stop_threshold '{}': {}",
+                                value, e
+                            ))
+                        })?;
+                    }
+                    "compaction_check_interval_ms" => {
+                        config.compaction_check_interval_ms =
+                            value.trim().parse().map_err(|e| {
+                                TitaniumError::ConfigError(format!(
+                                    "Invalid compaction_check_interval_ms '{}': {}",
+                                    value, e
+                                ))
+                            })?;
+                    }
+                    "min_free_space" => {
+                        config.min_free_space = value.trim().parse().map_err(|e| {
+                            TitaniumError::ConfigError(format!(
+                                "Invalid min_free_space '{}': {}",
+                                value, e
+                            ))
+                        })?;
+                    }
                     _ => {}
                 }
             }
